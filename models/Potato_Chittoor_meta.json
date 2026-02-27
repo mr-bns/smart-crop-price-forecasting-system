@@ -1,0 +1,21 @@
+{
+  "crop": "Potato",
+  "region": "Chittoor",
+  "n_points": 690,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 0.773,
+  "mae": 0.569,
+  "mape": 3.25,
+  "confidence": 97.1,
+  "reliability": "High",
+  "price_mean": 19.19,
+  "price_std": 0.19,
+  "last_date": "2026-02-23"
+}

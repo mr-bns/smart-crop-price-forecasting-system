@@ -1,0 +1,21 @@
+{
+  "crop": "GreenChilli",
+  "region": "Visakhapatnam",
+  "n_points": 696,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 2.268,
+  "mae": 1.787,
+  "mape": 4.972,
+  "confidence": 95.5,
+  "reliability": "High",
+  "price_mean": 40.07,
+  "price_std": 0.3,
+  "last_date": "2026-02-23"
+}

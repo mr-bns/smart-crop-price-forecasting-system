@@ -1,0 +1,21 @@
+{
+  "crop": "Brinjal",
+  "region": "Visakhapatnam",
+  "n_points": 693,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 0.699,
+  "mae": 0.555,
+  "mape": 3.837,
+  "confidence": 96.5,
+  "reliability": "High",
+  "price_mean": 15.8,
+  "price_std": 0.23,
+  "last_date": "2026-02-23"
+}

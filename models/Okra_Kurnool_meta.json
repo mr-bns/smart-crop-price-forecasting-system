@@ -1,0 +1,21 @@
+{
+  "crop": "Okra",
+  "region": "Kurnool",
+  "n_points": 694,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 3,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 1.188,
+  "mae": 0.814,
+  "mape": 4.074,
+  "confidence": 96.3,
+  "reliability": "High",
+  "price_mean": 18.24,
+  "price_std": 0.26,
+  "last_date": "2026-02-23"
+}

@@ -1,0 +1,21 @@
+{
+  "crop": "Tomato",
+  "region": "Chittoor",
+  "n_points": 687,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 1.191,
+  "mae": 0.823,
+  "mape": 6.967,
+  "confidence": 93.7,
+  "reliability": "High",
+  "price_mean": 15.37,
+  "price_std": 0.28,
+  "last_date": "2026-02-23"
+}

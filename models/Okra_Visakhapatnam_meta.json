@@ -1,0 +1,21 @@
+{
+  "crop": "Okra",
+  "region": "Visakhapatnam",
+  "n_points": 699,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 0.906,
+  "mae": 0.634,
+  "mape": 2.92,
+  "confidence": 97.4,
+  "reliability": "High",
+  "price_mean": 19.93,
+  "price_std": 0.25,
+  "last_date": "2026-02-23"
+}

@@ -1,0 +1,21 @@
+{
+  "crop": "Paddy",
+  "region": "Kurnool",
+  "n_points": 694,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 0.525,
+  "mae": 0.412,
+  "mape": 1.95,
+  "confidence": 98.0,
+  "reliability": "High",
+  "price_mean": 23.58,
+  "price_std": 0.12,
+  "last_date": "2026-02-23"
+}

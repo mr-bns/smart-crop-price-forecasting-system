@@ -1,0 +1,21 @@
+{
+  "crop": "Okra",
+  "region": "EastWestGodavari",
+  "n_points": 697,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 1.027,
+  "mae": 0.798,
+  "mape": 3.508,
+  "confidence": 96.8,
+  "reliability": "High",
+  "price_mean": 18.04,
+  "price_std": 0.28,
+  "last_date": "2026-02-23"
+}

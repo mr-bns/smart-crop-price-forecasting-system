@@ -1,0 +1,21 @@
+{
+  "crop": "Carrot",
+  "region": "Kurnool",
+  "n_points": 690,
+  "trained_date": "27 Feb 2026",
+  "best_params": {
+    "n_estimators": 500,
+    "min_child_weight": 5,
+    "reg_alpha": 0.0
+  },
+  "use_lgbm_blend": true,
+  "log_transformed": true,
+  "rmse": 1.396,
+  "mae": 1.018,
+  "mape": 6.171,
+  "confidence": 94.4,
+  "reliability": "High",
+  "price_mean": 23.38,
+  "price_std": 0.23,
+  "last_date": "2026-02-23"
+}
