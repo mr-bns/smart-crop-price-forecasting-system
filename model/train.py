@@ -1,14 +1,16 @@
 """
-Enhanced XGBoost crop price model training.
-Improvements for RMSE reduction & higher confidence:
-  1. Log1p price transformation (handles skew, reduces outlier penalty)
-  2. Extended lag features: 1,3,7,14,21,30 days
-  3. Price momentum & % change features
-  4. Cyclical sin/cos encoding of month & day-of-week
-  5. Broader hyperparameter grid (n_estimators, min_child_weight, reg_alpha)
-  6. n_splits=8 TimeSeriesSplit for more reliable CV
-  7. Optional LightGBM blend (60% XGB + 40% LGBM) if installed
-  8. Confidence based on actual MAPE with improved formula
+Enhanced XGBoost crop price model training — v2.0
+Improvements:
+  1. Seasonal intelligence (Kharif / Rabi / Summer)
+  2. Harvest-peak flag per crop (supply shock indicator)
+  3. Extended lag features: 1,3,7,14,30 days
+  4. Rolling mean/std: 7, 14, 30 days
+  5. Seasonal price adjustment after prediction
+  6. Broader hyperparameter search with early stopping
+  7. Rich metadata storage (feature_list, model_version, season)
+  8. log1p price transform to reduce RMSE
+  9. TimeSeriesSplit CV (n_splits=8)
+  10. Optional LightGBM blend (60% XGB + 40% LGBM)
 """
 
 import os
@@ -37,34 +39,81 @@ except ImportError:
 
 logging.basicConfig(level=logging.WARNING)
 
-DATA_PATH = "data/crops.csv"
-MODEL_DIR  = "models"
+DATA_PATH   = "data/crops.csv"
+MODEL_DIR   = "models"
+MODEL_VERSION = "2.0"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SEASONAL INTELLIGENCE
+# ─────────────────────────────────────────────────────────────────────────────
+def get_season(month: int) -> str:
+    """Return Indian agricultural season based on month."""
+    if month in [6, 7, 8, 9, 10]:
+        return "Kharif"
+    elif month in [11, 12, 1, 2, 3]:
+        return "Rabi"
+    else:  # 4, 5
+        return "Summer"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CROP HARVEST CALENDAR
+# Peak harvest months → harvest_peak_flag = 1
+# ─────────────────────────────────────────────────────────────────────────────
 HARVEST_MONTHS = {
-    "Tomato":      [11, 12, 1, 2],
-    "Onion":       [2, 3, 4, 5],
-    "Potato":      [11, 12, 1, 2],
-    "Paddy":       [10, 11, 12],
-    "BitterGourd": [3, 4, 5, 10, 11],
-    "Brinjal":     [1, 2, 3, 9, 10],
-    "BroadBeans":  [11, 12, 1, 2],
-    "Carrot":      [10, 11, 12, 1],
-    "GreenChilli": [9, 10, 11, 12],
-    "Okra":        [3, 4, 5, 6],
+    "Tomato":      [12, 1, 2],       # Dec–Feb
+    "Onion":       [3, 4, 5],        # Mar–May
+    "Potato":      [1, 2, 3],        # Jan–Mar
+    "Paddy":       [10, 11, 12],     # Oct–Dec
+    "BitterGourd": [5, 6, 7, 8],     # May–Aug
+    "Brinjal":     [9, 10, 11],      # Sep–Nov
+    "BroadBeans":  [11, 12, 1],      # Nov–Jan
+    "Carrot":      [11, 12, 1, 2],   # Nov–Feb
+    "GreenChilli": [1, 2, 3, 4],     # Jan–Apr
+    "Okra":        [5, 6, 7, 8],     # May–Aug
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SEASONAL PRICE ADJUSTMENT RULES
+# ─────────────────────────────────────────────────────────────────────────────
+SEASONAL_ADJUSTMENT = {
+    "Tomato":      {"Kharif": +0.05, "Rabi": -0.08, "Summer": +0.12},
+    "Onion":       {"Kharif": +0.08, "Rabi": -0.05, "Summer": -0.10},
+    "Potato":      {"Kharif": +0.06, "Rabi": -0.06, "Summer": +0.08},
+    "Paddy":       {"Kharif": -0.04, "Rabi": +0.03, "Summer": +0.05},
+    "BitterGourd": {"Kharif": -0.08, "Rabi": +0.10, "Summer": -0.06},
+    "Brinjal":     {"Kharif": -0.06, "Rabi": +0.04, "Summer": +0.06},
+    "BroadBeans":  {"Kharif": +0.05, "Rabi": -0.07, "Summer": +0.08},
+    "Carrot":      {"Kharif": +0.06, "Rabi": -0.05, "Summer": +0.10},
+    "GreenChilli": {"Kharif": +0.10, "Rabi": -0.10, "Summer": +0.07},
+    "Okra":        {"Kharif": -0.07, "Rabi": +0.08, "Summer": -0.05},
+}
+
+
+def apply_seasonal_adjustment(crop: str, season: str, predicted_price: float) -> float:
+    """Apply season-aware price adjustment to simulate real market cycles."""
+    factor = SEASONAL_ADJUSTMENT.get(crop, {}).get(season, 0.0)
+    adjusted = predicted_price * (1 + factor)
+    return round(float(adjusted), 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE COLUMNS (strict order — must match predict.py)
+# ─────────────────────────────────────────────────────────────────────────────
 FEATURE_COLS = [
     # Calendar — cyclical encoded
     "month_sin", "month_cos", "dow_sin", "dow_cos",
     "weekofyear", "dayofyear", "quarter",
-    # Lags
-    "lag_1", "lag_3", "lag_7", "lag_14", "lag_21", "lag_30",
-    # Rolling stats
-    "roll_mean_7", "roll_mean_14", "roll_std_7",
+    # Required lags
+    "lag_1", "lag_3", "lag_7", "lag_14", "lag_30",
+    # Rolling statistics
+    "rolling_mean_7", "rolling_mean_14", "rolling_mean_30",
+    "rolling_std_7", "rolling_std_30",
     # Momentum
     "price_change_7", "price_pct_7",
     # Seasonal
-    "harvest",
+    "season_kharif", "season_rabi", "season_summer",
+    "harvest_peak_flag",
 ]
 
 
@@ -72,9 +121,10 @@ def engineer_features(df: pd.DataFrame, crop: str) -> pd.DataFrame:
     df = df.copy().sort_values("ds").reset_index(drop=True)
     df["ds"] = pd.to_datetime(df["ds"])
 
-    # ── Calendar (cyclical) ─────────────────────────────────────────────────
     month = df["ds"].dt.month
     dow   = df["ds"].dt.dayofweek
+
+    # ── Calendar (cyclical) ──────────────────────────────────────────────────
     df["month_sin"]  = np.sin(2 * np.pi * month / 12)
     df["month_cos"]  = np.cos(2 * np.pi * month / 12)
     df["dow_sin"]    = np.sin(2 * np.pi * dow / 7)
@@ -83,23 +133,31 @@ def engineer_features(df: pd.DataFrame, crop: str) -> pd.DataFrame:
     df["dayofyear"]  = df["ds"].dt.dayofyear
     df["quarter"]    = df["ds"].dt.quarter
 
-    # ── Lag features ────────────────────────────────────────────────────────
-    for lag in [1, 3, 7, 14, 21, 30]:
+    # ── Lag features ─────────────────────────────────────────────────────────
+    for lag in [1, 3, 7, 14, 30]:
         df[f"lag_{lag}"] = df["y"].shift(lag)
 
-    # ── Rolling stats (lag-1 shifted to prevent leakage) ────────────────────
+    # ── Rolling statistics (lag-1 shifted to prevent leakage) ────────────────
     shifted = df["y"].shift(1)
-    df["roll_mean_7"]  = shifted.rolling(7).mean()
-    df["roll_mean_14"] = shifted.rolling(14).mean()
-    df["roll_std_7"]   = shifted.rolling(7).std().fillna(0)
+    df["rolling_mean_7"]  = shifted.rolling(7,  min_periods=1).mean()
+    df["rolling_mean_14"] = shifted.rolling(14, min_periods=1).mean()
+    df["rolling_mean_30"] = shifted.rolling(30, min_periods=1).mean()
+    df["rolling_std_7"]   = shifted.rolling(7,  min_periods=2).std().fillna(0)
+    df["rolling_std_30"]  = shifted.rolling(30, min_periods=2).std().fillna(0)
 
     # ── Momentum ─────────────────────────────────────────────────────────────
     df["price_change_7"] = df["y"] - df["y"].shift(7)
     df["price_pct_7"]    = df["y"].pct_change(7).replace([np.inf, -np.inf], 0).fillna(0)
 
-    # ── Harvest indicator ────────────────────────────────────────────────────
+    # ── Seasonal one-hot ──────────────────────────────────────────────────────
+    seasons = month.apply(get_season)
+    df["season_kharif"] = (seasons == "Kharif").astype(int)
+    df["season_rabi"]   = (seasons == "Rabi").astype(int)
+    df["season_summer"] = (seasons == "Summer").astype(int)
+
+    # ── Harvest peak flag ─────────────────────────────────────────────────────
     hm = HARVEST_MONTHS.get(crop, [])
-    df["harvest"] = month.isin(hm).astype(int)
+    df["harvest_peak_flag"] = month.isin(hm).astype(int)
 
     return df.dropna(subset=FEATURE_COLS)
 
@@ -120,55 +178,82 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
     raw["ds"] = pd.to_datetime(raw["ds"])
     raw = raw.sort_values("ds").drop_duplicates("ds").reset_index(drop=True)
 
-    # Remove outliers (2.5σ — tighter than before for cleaner signal)
-    mu, sigma = raw["y"].mean(), raw["y"].std()
-    raw = raw[(raw["y"] >= mu - 2.5 * sigma) & (raw["y"] <= mu + 2.5 * sigma)].copy()
+    if len(raw) < 60:
+        return None
 
-    # ── Log1p transform ──────────────────────────────────────────────────────
+    # ── Outlier removal (IQR method + z-score) ───────────────────────────────
+    q1, q3 = raw["y"].quantile(0.25), raw["y"].quantile(0.75)
+    iqr     = q3 - q1
+    mu, sigma = raw["y"].mean(), raw["y"].std()
+    raw = raw[
+        (raw["y"] >= q1 - 1.5 * iqr) & (raw["y"] <= q3 + 1.5 * iqr) &
+        (raw["y"] >= mu - 2.5 * sigma) & (raw["y"] <= mu + 2.5 * sigma)
+    ].copy()
+
+    if len(raw) < 50:
+        return None
+
+    price_mean_orig = float(raw["y"].mean())
+    price_std_orig  = float(raw["y"].std())
+
+    # ── Log1p transform ───────────────────────────────────────────────────────
     raw["y"] = np.log1p(raw["y"])
 
     feat_df = engineer_features(raw, crop)
     if len(feat_df) < 50:
         return None
 
-    X = feat_df[FEATURE_COLS]          # keep as DataFrame — preserves feature names
+    X = feat_df[FEATURE_COLS]
     y = feat_df["y"].values
 
-    # 80/20 holdout (time-based)
+    # ── 80/20 time-based holdout ──────────────────────────────────────────────
     split  = int(len(X) * 0.80)
     X_tr, X_te = X.iloc[:split], X.iloc[split:]
     y_tr, y_te = y[:split], y[split:]
 
-    # ── TimeSeriesSplit CV (n_splits=8) to find best hyperparams ────────────
+    # ── Hyperparameter grid search with TimeSeriesSplit ───────────────────────
     tscv = TimeSeriesSplit(n_splits=8)
-    best_xgb_params = {"n_estimators": 300, "min_child_weight": 3, "reg_alpha": 0.1}
-    best_cv_rmse    = float("inf")
+    best_params  = {"n_estimators": 400, "max_depth": 5, "learning_rate": 0.04,
+                    "subsample": 0.85, "colsample_bytree": 0.80,
+                    "min_child_weight": 3, "gamma": 0.1, "reg_alpha": 0.1}
+    best_cv_rmse = float("inf")
 
-    for n_est in [200, 300, 500]:
-        for mcw in [1, 3, 5]:
-            for alpha in [0.0, 0.1, 0.5]:
-                cv_rmses = []
-                for tr_i, val_i in tscv.split(X_tr):
-                    if len(val_i) < 4:
-                        continue
-                    m = XGBRegressor(
-                        n_estimators=n_est, max_depth=5, learning_rate=0.04,
-                        min_child_weight=mcw, reg_alpha=alpha, reg_lambda=1.0,
-                        subsample=0.85, colsample_bytree=0.80,
-                        random_state=42, verbosity=0, n_jobs=-1,
-                    )
-                    m.fit(X_tr.iloc[tr_i], y_tr[tr_i])
-                    preds = m.predict(X_tr.iloc[val_i])
-                    cv_rmses.append(np.sqrt(mean_squared_error(y_tr[val_i], preds)))
+    param_grid = [
+        {"n_estimators": 300, "max_depth": 4, "learning_rate": 0.05, "min_child_weight": 2, "gamma": 0.0, "reg_alpha": 0.0},
+        {"n_estimators": 400, "max_depth": 5, "learning_rate": 0.04, "min_child_weight": 3, "gamma": 0.1, "reg_alpha": 0.1},
+        {"n_estimators": 500, "max_depth": 5, "learning_rate": 0.03, "min_child_weight": 4, "gamma": 0.0, "reg_alpha": 0.1},
+        {"n_estimators": 300, "max_depth": 6, "learning_rate": 0.05, "min_child_weight": 2, "gamma": 0.1, "reg_alpha": 0.0},
+        {"n_estimators": 500, "max_depth": 4, "learning_rate": 0.04, "min_child_weight": 3, "gamma": 0.0, "reg_alpha": 0.0},
+        {"n_estimators": 400, "max_depth": 6, "learning_rate": 0.03, "min_child_weight": 5, "gamma": 0.1, "reg_alpha": 0.1},
+    ]
 
-                if cv_rmses and np.mean(cv_rmses) < best_cv_rmse:
-                    best_cv_rmse = float(np.mean(cv_rmses))
-                    best_xgb_params = {"n_estimators": n_est, "min_child_weight": mcw, "reg_alpha": alpha}
+    for params in param_grid:
+        cv_rmses = []
+        for tr_i, val_i in tscv.split(X_tr):
+            if len(val_i) < 4:
+                continue
+            m = XGBRegressor(
+                **params,
+                reg_lambda=1.0, subsample=0.85, colsample_bytree=0.80,
+                random_state=42, verbosity=0, n_jobs=-1,
+                early_stopping_rounds=30,
+                eval_metric="rmse",
+            )
+            m.fit(
+                X_tr.iloc[tr_i], y_tr[tr_i],
+                eval_set=[(X_tr.iloc[val_i], y_tr[val_i])],
+                verbose=False,
+            )
+            preds = m.predict(X_tr.iloc[val_i])
+            cv_rmses.append(np.sqrt(mean_squared_error(y_tr[val_i], preds)))
 
-    # ── Train final XGBoost on full training set ─────────────────────────────
+        if cv_rmses and np.mean(cv_rmses) < best_cv_rmse:
+            best_cv_rmse = float(np.mean(cv_rmses))
+            best_params  = {**params}
+
+    # ── Train final XGBoost ───────────────────────────────────────────────────
     xgb_model = XGBRegressor(
-        **best_xgb_params,
-        max_depth=5, learning_rate=0.04,
+        **best_params,
         reg_lambda=1.0, subsample=0.85, colsample_bytree=0.80,
         random_state=42, verbosity=0, n_jobs=-1,
     )
@@ -179,10 +264,11 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
     if HAS_LGBM and len(X_tr) >= 60:
         try:
             lgbm_model = LGBMRegressor(
-                n_estimators=best_xgb_params["n_estimators"],
-                max_depth=5, learning_rate=0.04,
+                n_estimators=best_params["n_estimators"],
+                max_depth=best_params["max_depth"],
+                learning_rate=best_params["learning_rate"],
                 num_leaves=31, min_child_samples=10,
-                reg_alpha=best_xgb_params["reg_alpha"],
+                reg_alpha=best_params["reg_alpha"],
                 subsample=0.85, colsample_bytree=0.80,
                 random_state=42, verbose=-1, n_jobs=-1,
             )
@@ -191,20 +277,17 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
             lgbm_model = None
 
     # ── Evaluate on holdout ───────────────────────────────────────────────────
+    rmse = mae = mape = None
     if len(X_te) >= 5:
-        preds_xgb = xgb_model.predict(X_te)   # X_te is a DataFrame
+        preds_xgb = xgb_model.predict(X_te)
         if lgbm_model is not None:
             preds_lgbm = lgbm_model.predict(X_te)
             preds_te   = 0.60 * preds_xgb + 0.40 * preds_lgbm
         else:
             preds_te = preds_xgb
-
-        # Inverse log-transform before computing real-price RMSE/MAPE
-        y_te_real   = np.expm1(y_te)
-        preds_real  = np.expm1(preds_te)
+        y_te_real  = np.expm1(y_te)
+        preds_real = np.expm1(preds_te)
         rmse, mae, mape = compute_metrics(y_te_real, preds_real)
-    else:
-        rmse = mae = mape = None
 
     # ── Re-fit on ALL data for deployment ────────────────────────────────────
     xgb_model.fit(X, y)
@@ -213,7 +296,6 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
 
     # ── Confidence & reliability ──────────────────────────────────────────────
     if mape is not None:
-        # More generous formula: MAPE 5% → ~95.5%, MAPE 10% → ~91%, MAPE 18% → ~84%
         confidence  = float(np.clip(100 - mape * 0.9, 75, 98))
         reliability = "High" if mape < 10 else ("Medium" if mape < 18 else "Low")
     else:
@@ -221,37 +303,39 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
         reliability = "Medium"
 
     metadata = {
-        "crop":           crop,
-        "region":         region,
-        "n_points":       len(feat_df),
-        "trained_date":   datetime.now().strftime("%d %b %Y"),
-        "best_params":    best_xgb_params,
-        "use_lgbm_blend": lgbm_model is not None,
-        "log_transformed": True,
-        "rmse":           rmse,
-        "mae":            mae,
-        "mape":           mape,
-        "confidence":     round(confidence, 1),
-        "reliability":    reliability,
-        "price_mean":     round(float(np.expm1(raw["y"].mean())), 2),
-        "price_std":      round(float(raw["y"].std()), 2),
-        "last_date":      str(raw["ds"].max().date()),
+        "crop":             crop,
+        "region":           region,
+        "n_points":         len(feat_df),
+        "training_date":    datetime.now().strftime("%d %b %Y"),
+        "training_records": len(raw),
+        "best_params":      best_params,
+        "use_lgbm_blend":   lgbm_model is not None,
+        "log_transformed":  True,
+        "rmse":             rmse,
+        "mae":              mae,
+        "mape":             mape,
+        "confidence":       round(confidence, 1),
+        "reliability":      reliability,
+        "model_version":    MODEL_VERSION,
+        "feature_list":     FEATURE_COLS,
+        "price_mean":       round(price_mean_orig, 2),
+        "price_std":        round(price_std_orig, 2),
+        "last_date":        str(raw["ds"].max().date()),
     }
 
-    # Pack both models together for saving
     model_bundle = {"xgb": xgb_model, "lgbm": lgbm_model}
     return model_bundle, metadata
 
 
 def train_all_models():
-    print("🚀 Starting Enhanced XGBoost Training (log-transform + cyclical + LightGBM blend)…")
+    print("🚀 Starting Enhanced XGBoost v2 Training (seasonal + harvest calendar + IQR)…")
     if HAS_LGBM:
-        print("   ✅ LightGBM detected — will create blend models")
+        print("   ✅ LightGBM detected — blend models enabled")
     else:
-        print("   ℹ️  LightGBM not found — using XGBoost only (pip install lightgbm for blend)")
+        print("   ℹ️  LightGBM not found — XGBoost only (pip install lightgbm)")
 
     if not os.path.exists(DATA_PATH):
-        print(f"❌ {DATA_PATH} not found.")
+        print(f"❌ {DATA_PATH} not found. Run generate_data.py first.")
         return
 
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -261,6 +345,10 @@ def train_all_models():
     except Exception as e:
         print(f"❌ {e}")
         return
+
+    # Remove duplicates globally
+    df = df.drop_duplicates(subset=["date", "crop", "region"])
+    df = df.dropna(subset=["price"])
 
     combinations = df[["crop", "region"]].drop_duplicates().values
     count, skipped = 0, 0
@@ -277,13 +365,15 @@ def train_all_models():
                 continue
 
             bundle, meta = result
-
             joblib.dump(bundle, os.path.join(MODEL_DIR, f"{crop}_{region}.joblib"))
             with open(os.path.join(MODEL_DIR, f"{crop}_{region}_meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)
 
             blend_tag = " [XGB+LGBM]" if meta["use_lgbm_blend"] else " [XGB]"
-            mape_str  = f"MAPE={meta['mape']}%  confidence={meta['confidence']}%  [{meta['reliability']}]{blend_tag}"
+            mape_str  = (
+                f"RMSE={meta['rmse']}  MAPE={meta['mape']}%  "
+                f"conf={meta['confidence']}%  [{meta['reliability']}]{blend_tag}"
+            )
             print(f"✅  {mape_str}")
             count += 1
 
