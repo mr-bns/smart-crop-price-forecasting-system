@@ -278,7 +278,11 @@ def _load_bundle(crop: str, region: str):
     try:
         bundle = joblib.load(path)
         return bundle if isinstance(bundle, dict) else {"xgb": bundle, "lgbm": None}
-    except Exception:
+    except Exception as e:
+        import traceback
+        with open(os.path.join(MODEL_DIR, "error.log"), "a") as f:
+            f.write(f"FAILED TO LOAD MODEL {path}: {e}\n")
+            f.write(traceback.format_exc() + "\n")
         return None
 
 

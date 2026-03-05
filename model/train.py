@@ -222,13 +222,8 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
                 **params,
                 reg_lambda=1.0, subsample=0.85, colsample_bytree=0.80,
                 random_state=42, verbosity=0, n_jobs=-1,
-                early_stopping_rounds=30, eval_metric="rmse",
             )
-            m.fit(
-                X_tr.iloc[tr_i], y_tr[tr_i],
-                eval_set=[(X_tr.iloc[val_i], y_tr[val_i])],
-                verbose=False,
-            )
+            m.fit(X_tr.iloc[tr_i], y_tr[tr_i])
             preds = m.predict(X_tr.iloc[val_i])
             cv_rmses.append(np.sqrt(mean_squared_error(y_tr[val_i], preds)))
 
