@@ -1,67 +1,59 @@
-import requests
+"""
+groq_ai.py  —  Groq LLM Advisory (optional, not used by main app)
+==================================================================
+This module is available for future use but is NOT currently called
+by app.py — the built-in advisory engine in advisory.py is used instead.
+
+To re-enable: import and call ai_explain() from app.py where needed.
+"""
+
 import os
+import requests
 
-# Get API Key securely
-API_KEY = os.environ.get("GROQ_API_KEY")
 
-def ai_explain(crop, price, lang="en"):
+def ai_explain(crop: str, price: float, lang: str = "en") -> str:
     """
-    Generate a simple explanation for the farmer using Groq AI.
+    Generate a simple farmer advisory using Groq LLM.
+    Returns a plain-text string, or a fallback message if unavailable.
     """
-    if not API_KEY:
-        return "⚠ AI Key Missing. Please check .env file."
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return ""   # Silent fallback — caller should handle empty string
 
-    # Map language code to name
-    lang_map = {
-        "en": "English",
-        "hi": "Hindi",
-        "te": "Telugu"
-    }
+    lang_map = {"en": "English", "te": "Telugu"}
     language = lang_map.get(lang, "English")
 
-    prompt = f"""
-    Act as a friendly agricultural expert advising a farmer.
-    Language: {language} (Use simple, daily spoken words that farmers easily understand).
-
-    Context:
-    - Crop: {crop}
-    - Predicted Price: ₹{price}/kg
-
-    Task:
-    1. Tell the farmer the price clearly.
-    2. Give 1 piece of advice (sell now or wait).
-    
-    Constraints:
-    - Keep it short (maximum 2-3 sentences).
-    - Do NOT use complex bookish translation. Use natural conversational tone.
-    - CRITICAL: Ensure the response is COMPLETE. Do not cut off in the middle. Finish your sentence.
-    """
+    prompt = (
+        f"Act as a friendly agricultural expert advising an Indian farmer.\n"
+        f"Language: {language} — use simple, conversational words farmers easily understand.\n\n"
+        f"Context:\n"
+        f"  Crop: {crop}\n"
+        f"  Predicted Price: ₹{price}/kg\n\n"
+        f"Task:\n"
+        f"1. Tell the farmer the predicted price clearly.\n"
+        f"2. Give ONE piece of advice: sell now, wait, or monitor.\n\n"
+        f"Keep it under 3 sentences. Do NOT cut off mid-sentence."
+    )
 
     try:
-        response = requests.post(
+        resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
             },
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 500 # Increased to prevent unfinished sentences
+                "max_tokens": 150,
             },
-            timeout=10
+            timeout=8,
         )
-
-        if response.status_code != 200:
-            return f"⚠ AI unavailable (Status {response.status_code})"
-
-        data = response.json()
-        
-        if "choices" in data and data["choices"]:
-            return data["choices"][0]["message"]["content"].strip()
-            
-        return "⚠ AI response empty."
-
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("choices"):
+                return data["choices"][0]["message"]["content"].strip()
+        return ""
     except Exception:
-        return "⚠ AI connection failed."
+        return ""   # Silent fallback

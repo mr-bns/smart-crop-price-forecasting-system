@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Resolve project root ──────────────────────────────────────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 try:
     from model.predict import run_prediction
     from market_data import get_market_price
@@ -21,7 +24,7 @@ except ImportError as e:
     st.stop()
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-DATA_PATH  = "data/crops.csv"
+DATA_PATH  = os.path.join(_HERE, "data", "crops.csv")
 CROPS      = ["Tomato","Onion","Potato","Paddy","BitterGourd","Brinjal","BroadBeans","Carrot","GreenChilli","Okra"]
 DISTRICTS  = ["Krishna","Guntur","Visakhapatnam","EastWestGodavari","Chittoor","Kurnool"]
 
@@ -59,7 +62,8 @@ UI = {
         "explain_tag":"WHY THIS PRICE?","explain_title":"AI Explanation",
         "explain_sub":"Factors influencing the predicted price",
         "dl_btn":"📥  Download Forecast Report","spinning":"🧠 AI model is computing your forecast…",
-        "no_model":"No trained model found. Please run: python model/train.py",
+        "no_model":"No trained model found for this crop/district. Please run: python model/train.py",
+        "no_data":"Historical data not found. Please run: python generate_data.py",
         "past_date":"The selected date is too far in the past.",
         "fc_limit":"Forecast is limited to 30 days ahead.",
         "generic_err":"An unexpected error occurred. Please try again.",
@@ -96,7 +100,8 @@ UI = {
         "explain_tag":"ఈ ధర ఎందుకు?","explain_title":"AI వివరణ",
         "explain_sub":"ఊహించిన ధరను ప్రభావితం చేసే అంశాలు",
         "dl_btn":"📥  అంచనా నివేదిక డౌన్‌లోడ్ చేయండి","spinning":"🧠 AI మోడల్ మీ అంచనాను లెక్కిస్తోంది…",
-        "no_model":"శిక్షణ పొందిన మోడల్ కనుగొనబడలేదు. దయచేసి అమలు చేయండి: python model/train.py",
+        "no_model":"ఈ పంట/జిల్లాకు శిక్షణ పొందిన మోడల్ కనుగొనబడలేదు. దయచేసి అమలు చేయండి: python model/train.py",
+        "no_data":"చారిత్రక డేటా కనుగొనబడలేదు. దయచేసి అమలు చేయండి: python generate_data.py",
         "past_date":"ఎంచుకున్న తేదీ చాలా గతంలో ఉంది.","fc_limit":"అంచనా 30 రోజులకు మాత్రమే పరిమితం.",
         "generic_err":"అనుకోని లోపం సంభవించింది. మళ్ళీ ప్రయత్నించండి.",
         "stat_models":"శిక్షణ పొందిన మోడళ్లు","stat_crops":"పంటలు","stat_dist":"జిల్లాలు","stat_window":"అంచనా విండో",
@@ -118,7 +123,7 @@ st.set_page_config(
 )
 
 # ─── Session State ────────────────────────────────────────────────────────────
-for k, v in [("lang","en"),("result",None),("show_res",False)]:
+for k, v in [("lang","en"),("result",None),("show_res",False),("freshness",-1)]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -257,6 +262,17 @@ def load_data():
         return df
     return pd.DataFrame()
 
+def get_data_freshness_days() -> int:
+    """Return how many days old the CSV data is (0 = current, -1 = missing)."""
+    if not os.path.exists(DATA_PATH):
+        return -1
+    try:
+        df = pd.read_csv(DATA_PATH, usecols=["date"])
+        last = pd.to_datetime(df["date"]).max()
+        return int((datetime.today() - last).days)
+    except Exception:
+        return -1
+
 # ─── Helper Components ────────────────────────────────────────────────────────
 def metric_card(label, value, sub, color="#fff"):
     return f"""<div class="metric-card">
@@ -383,8 +399,9 @@ st.markdown('</div>', unsafe_allow_html=True)
 # ─── PREDICTION LOGIC ─────────────────────────────────────────────────────────
 if predict_clicked:
     st.session_state.show_res = False
+    st.session_state.freshness = get_data_freshness_days()
     with st.spinner(T["spinning"]):
-        time.sleep(0.8)
+        time.sleep(0.3)
         try:
             low, high = get_market_price(region_key, crop_key)
             result = run_prediction(
@@ -408,12 +425,26 @@ if predict_clicked:
 # ─── SECTION 4 — RESULTS ──────────────────────────────────────────────────────
 if st.session_state.show_res and st.session_state.result:
     res = st.session_state.result
+
+    # ── Data freshness warning ────────────────────────────────────────────────
+    freshness = st.session_state.get("freshness", -1)
+    if freshness > 7:
+        stale_msg = (
+            f"⚠️ Training data is {freshness} day(s) old — predictions may be less accurate. "
+            "Re-run `python generate_data.py` then `python model/train.py` to refresh."
+            if st.session_state.lang == "en"
+            else
+            f"⚠️ శిక్షణ డేటా {freshness} రోజులు పాతది — అంచనాలు తక్కువ ఖచ్చితమైనవిగా ఉండవచ్చు."
+        )
+        st.warning(stale_msg)
+
     st.markdown('<div class="section results-section section-compact" id="results">', unsafe_allow_html=True)
     st.markdown(f'<div class="section-tag">{T["res_tag"]}</div>', unsafe_allow_html=True)
 
     if "error" in res:
         err_map = {
-            "NO_DATA":        T["no_model"],
+            "NO_MODEL":       T["no_model"],
+            "NO_DATA":        T.get("no_data", T["no_model"]),
             "PAST_DATE":      T["past_date"],
             "FORECAST_LIMIT": T["fc_limit"],
             "GENERIC_ERROR":  T["generic_err"],

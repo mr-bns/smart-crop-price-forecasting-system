@@ -1,13 +1,14 @@
 """
-XGBoost + optional LightGBM blend prediction engine — v2.0
-Matches the enhanced feature set from model/train.py v2.0:
-  - Seasonal intelligence (Kharif / Rabi / Summer)
-  - Harvest peak flag per crop
-  - Extended lags: 1, 3, 7, 14, 30
-  - Rolling mean/std: 7, 14, 30 days
-  - Seasonal price adjustment post-prediction
-  - Explainable AI reasoning text generation
-  - Log1p inverse-transform (expm1) when model was trained with log
+model/predict.py  —  XGBoost + LightGBM Prediction Engine v2.1
+================================================================
+Key improvements over v2.0:
+  • Absolute paths — works from any working directory
+  • Distinct error codes: NO_MODEL (file missing) vs NO_DATA (CSV missing/empty)
+  • Increased history window to 120 rows for robust lag/rolling features
+  • Forward-fill before median fallback for NaN imputation
+  • Seasonal adjustment weight reduced to 40 % to avoid double-counting
+  • Data freshness check — warns if CSV is > 14 days stale
+  • Cleaner, well-documented code throughout
 """
 
 import os
@@ -18,27 +19,29 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ── Resolve project root ──────────────────────────────────────────────────────
+_HERE    = os.path.dirname(os.path.abspath(__file__))  # …/prototype/model
+_PROJECT = os.path.dirname(_HERE)                       # …/prototype
+sys.path.insert(0, _PROJECT)
 
-DATA_PATH = "data/crops.csv"
-MODEL_DIR = "models"
-MAX_DAYS  = 30
+DATA_PATH = os.path.join(_PROJECT, "data", "crops.csv")
+MODEL_DIR = os.path.join(_PROJECT, "models")
+MAX_DAYS  = 30   # maximum forecast horizon
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SEASONAL INTELLIGENCE
 # ─────────────────────────────────────────────────────────────────────────────
 def get_season(month: int) -> str:
-    """Return Indian agricultural season based on month."""
+    """Return Indian agricultural season name for the given month."""
     if month in [6, 7, 8, 9, 10]:
         return "Kharif"
-    elif month in [11, 12, 1, 2, 3]:
+    if month in [11, 12, 1, 2, 3]:
         return "Rabi"
-    else:
-        return "Summer"
+    return "Summer"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HARVEST CALENDAR
+# HARVEST CALENDAR  (peak harvest months → high supply → lower prices)
 # ─────────────────────────────────────────────────────────────────────────────
 HARVEST_MONTHS = {
     "Tomato":      [12, 1, 2],
@@ -53,6 +56,8 @@ HARVEST_MONTHS = {
     "Okra":        [5, 6, 7, 8],
 }
 
+# Seasonal price adjustment — reduced weight (0.40×) to avoid double-counting
+# the seasonality that the XGBoost model already learns from seasonal features.
 SEASONAL_ADJUSTMENT = {
     "Tomato":      {"Kharif": +0.05, "Rabi": -0.08, "Summer": +0.12},
     "Onion":       {"Kharif": +0.08, "Rabi": -0.05, "Summer": -0.10},
@@ -71,7 +76,7 @@ SEASON_SUPPLY_NOTES = {
         "en": "Monsoon season — moderate supply with weather uncertainty.",
         "te": "వర్షాకాలం — వాతావరణ అనిశ్చితతో మధ్యస్థ సరఫరా.",
     },
-    "Rabi":   {
+    "Rabi": {
         "en": "Winter season — generally stable supply conditions.",
         "te": "శీతాకాలం — సాధారణంగా స్థిరమైన సరఫరా పరిస్థితులు.",
     },
@@ -81,15 +86,19 @@ SEASON_SUPPLY_NOTES = {
     },
 }
 
+
 def apply_seasonal_adjustment(crop: str, season: str, predicted_price: float) -> float:
-    """Apply season-aware price adjustment to simulate real market cycles."""
-    factor   = SEASONAL_ADJUSTMENT.get(crop, {}).get(season, 0.0)
-    adjusted = predicted_price * (1 + factor)
-    return round(float(adjusted), 2)
+    """
+    Apply a *blended* post-prediction seasonal correction.
+    Weight = 0.40 to avoid doubling the seasonality the model already learned.
+    """
+    raw_factor = SEASONAL_ADJUSTMENT.get(crop, {}).get(season, 0.0)
+    blended    = raw_factor * 0.40   # reduce overcorrection
+    return round(float(predicted_price * (1 + blended)), 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEATURE COLUMNS — must stay identical to model/train.py v2.0
+# FEATURE COLUMNS — must stay identical to model/train.py
 # ─────────────────────────────────────────────────────────────────────────────
 FEATURE_COLS = [
     "month_sin", "month_cos", "dow_sin", "dow_cos",
@@ -107,29 +116,29 @@ FEATURE_COLS = [
 # ─────────────────────────────────────────────────────────────────────────────
 EXPLANATION_TEMPLATES = {
     "en": {
-        "season":     "Current season: {season}",
-        "supply":     "{supply_note}",
-        "harvest_on": "{crop} is currently in its peak harvest period — supply is high, which typically lowers prices.",
-        "harvest_off":"{crop} is NOT in peak harvest — supply tightens, which often pushes prices up.",
-        "trend_up":   "Historical prices show an upward trend over the last 30 days.",
-        "trend_down": "Historical prices show a downward trend over the last 30 days.",
+        "season":      "Current season: {season}",
+        "supply":      "{supply_note}",
+        "harvest_on":  "{crop} is in peak harvest — high supply typically lowers prices.",
+        "harvest_off": "{crop} is outside peak harvest — tighter supply often pushes prices up.",
+        "trend_up":    "Historical prices show an upward trend over the last 30 days.",
+        "trend_down":  "Historical prices show a downward trend over the last 30 days.",
         "trend_stable":"Historical prices have been relatively stable.",
-        "above_mkt":  "Predicted price (₹{pred}) is ABOVE current market average (₹{mkt_avg}) — demand appears strong.",
-        "below_mkt":  "Predicted price (₹{pred}) is BELOW current market average (₹{mkt_avg}) — caution advised.",
-        "near_mkt":   "Predicted price is close to current market average (₹{mkt_avg}) — stable market expected.",
+        "above_mkt":   "Forecast (₹{pred}) is ABOVE market average (₹{mkt_avg}) — strong demand signal.",
+        "below_mkt":   "Forecast (₹{pred}) is BELOW market average (₹{mkt_avg}) — consider selling now.",
+        "near_mkt":    "Forecast is close to market average (₹{mkt_avg}) — stable market expected.",
     },
     "te": {
-        "season":     "ప్రస్తుత సీజన్: {season}",
-        "supply":     "{supply_note}",
-        "harvest_on": "{crop} ప్రస్తుతం తన గరిష్ఠ కోత కాలంలో ఉంది — సరఫరా అధికంగా ఉంది, ఇది సాధారణంగా ధరలను తగ్గిస్తుంది.",
-        "harvest_off":"{crop} గరిష్ఠ కోత కాలంలో లేదు — సరఫరా తక్కువగా ఉంటుంది, ఇది తరచుగా ధరలను పెంచుతుంది.",
-        "trend_up":   "చారిత్రక ధరలు గత 30 రోజులలో పెరిగే ధోరణి చూపాయి.",
-        "trend_down": "చారిత్రక ధరలు గత 30 రోజులలో తగ్గే ధోరణి చూపాయి.",
+        "season":      "ప్రస్తుత సీజన్: {season}",
+        "supply":      "{supply_note}",
+        "harvest_on":  "{crop} గరిష్ఠ కోత కాలంలో ఉంది — అధిక సరఫరా సాధారణంగా ధరలను తగ్గిస్తుంది.",
+        "harvest_off": "{crop} గరిష్ఠ కోత కాలంలో లేదు — తక్కువ సరఫరా తరచుగా ధరలను పెంచుతుంది.",
+        "trend_up":    "చారిత్రక ధరలు గత 30 రోజులలో పెరిగే ధోరణి చూపాయి.",
+        "trend_down":  "చారిత్రక ధరలు గత 30 రోజులలో తగ్గే ధోరణి చూపాయి.",
         "trend_stable":"చారిత్రక ధరలు సాపేక్షంగా స్థిరంగా ఉన్నాయి.",
-        "above_mkt":  "ఊహించిన ధర (₹{pred}) ప్రస్తుత మార్కెట్ సగటు (₹{mkt_avg}) కంటే ఎక్కువ — డిమాండ్ బలంగా కనిపిస్తోంది.",
-        "below_mkt":  "ఊహించిన ధర (₹{pred}) ప్రస్తుత మార్కెట్ సగటు (₹{mkt_avg}) కంటే తక్కువ — జాగ్రత్త అవసరం.",
-        "near_mkt":   "ఊహించిన ధర ప్రస్తుత మార్కెట్ సగటు (₹{mkt_avg}) కు దగ్గరగా ఉంది — స్థిరమైన మార్కెట్ ఆశించబడుతోంది.",
-    }
+        "above_mkt":   "అంచనా ధర (₹{pred}) మార్కెట్ సగటు (₹{mkt_avg}) కంటే ఎక్కువ — డిమాండ్ బలంగా ఉంది.",
+        "below_mkt":   "అంచనా ధర (₹{pred}) మార్కెట్ సగటు (₹{mkt_avg}) కంటే తక్కువ — ఇప్పుడు అమ్మడం మంచిది.",
+        "near_mkt":    "అంచనా ధర మార్కెట్ సగటు (₹{mkt_avg}) కు దగ్గరగా ఉంది — మార్కెట్ స్థిరంగా ఉంటుంది.",
+    },
 }
 
 
@@ -143,7 +152,7 @@ def generate_explanation(
     market_high: float = None,
     lang: str = "en",
 ) -> list:
-    """Generate a list of human-readable explanation bullet points."""
+    """Return a list of human-readable bullet-point explanation strings."""
     T   = EXPLANATION_TEMPLATES.get(lang, EXPLANATION_TEMPLATES["en"])
     SN  = SEASON_SUPPLY_NOTES.get(season, {})
     pts = []
@@ -154,10 +163,7 @@ def generate_explanation(
     if supply_note:
         pts.append(T["supply"].format(supply_note=supply_note))
 
-    if harvest_on:
-        pts.append(T["harvest_on"].format(crop=crop))
-    else:
-        pts.append(T["harvest_off"].format(crop=crop))
+    pts.append(T["harvest_on" if harvest_on else "harvest_off"].format(crop=crop))
 
     if abs(trend_slope) < 0.5:
         pts.append(T["trend_stable"])
@@ -167,7 +173,7 @@ def generate_explanation(
         pts.append(T["trend_down"])
 
     if market_low is not None and market_high is not None:
-        mkt_avg = round((market_low + market_high) / 2, 2)
+        mkt_avg  = round((market_low + market_high) / 2, 2)
         diff_pct = (price - mkt_avg) / mkt_avg * 100 if mkt_avg else 0
         if diff_pct > 7:
             pts.append(T["above_mkt"].format(pred=price, mkt_avg=mkt_avg))
@@ -183,9 +189,16 @@ def generate_explanation(
 # FEATURE BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_prediction_features(
-    crop: str, crop_df: pd.DataFrame, target_date: datetime,
+    crop: str,
+    crop_df: pd.DataFrame,
+    target_date: datetime,
     log_transformed: bool = True,
 ) -> pd.DataFrame:
+    """
+    Build a single-row feature DataFrame for the target_date prediction.
+    Uses up to 120 rows of history to ensure all lags/rolling windows are
+    well-populated (lag_30 needs at least 31 rows).
+    """
     hist = crop_df[["date", "price"]].copy()
     hist.columns = ["ds", "y"]
     hist["ds"] = pd.to_datetime(hist["ds"])
@@ -194,8 +207,9 @@ def _build_prediction_features(
     if log_transformed:
         hist["y"] = np.log1p(hist["y"])
 
+    # Use 120 rows of history (up from 90) for better lag/rolling coverage
     target_row = pd.DataFrame({"ds": [pd.Timestamp(target_date)], "y": [np.nan]})
-    combined   = pd.concat([hist.tail(90), target_row], ignore_index=True)
+    combined   = pd.concat([hist.tail(120), target_row], ignore_index=True)
     combined   = combined.sort_values("ds").reset_index(drop=True)
 
     ts = combined["ds"]
@@ -213,11 +227,11 @@ def _build_prediction_features(
     combined["dayofyear"]  = ts.dt.dayofyear
     combined["quarter"]    = ts.dt.quarter
 
-    # ── Lags ─────────────────────────────────────────────────────────────────
+    # ── Extended lags ────────────────────────────────────────────────────────
     for lag in [1, 3, 7, 14, 30]:
         combined[f"lag_{lag}"] = y.shift(lag)
 
-    # ── Rolling ──────────────────────────────────────────────────────────────
+    # ── Rolling statistics  (shift-1 to prevent leakage) ────────────────────
     shifted = y.shift(1)
     combined["rolling_mean_7"]  = shifted.rolling(7,  min_periods=1).mean()
     combined["rolling_mean_14"] = shifted.rolling(14, min_periods=1).mean()
@@ -241,31 +255,35 @@ def _build_prediction_features(
 
     pred_row = combined.tail(1)[FEATURE_COLS].copy()
 
-    # Fill any NaNs
+    # ── NaN imputation: forward-fill first, then median fallback ─────────────
     for col in FEATURE_COLS:
         if pred_row[col].isna().any():
-            fill = combined[col].dropna().median()
+            fwd = combined[col].ffill()
+            fill_val = fwd.iloc[-1] if not pd.isna(fwd.iloc[-1]) else combined[col].median()
             pred_row[col] = pred_row[col].fillna(
-                fill if (fill is not None and not np.isnan(float(fill))) else 0
+                fill_val if (fill_val is not None and not np.isnan(float(fill_val))) else 0.0
             )
 
     return pred_row
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL LOADERS
+# ─────────────────────────────────────────────────────────────────────────────
 def _load_bundle(crop: str, region: str):
+    """Load the joblib model bundle. Returns None if file missing or corrupt."""
     path = os.path.join(MODEL_DIR, f"{crop}_{region}.joblib")
     if not os.path.exists(path):
         return None
     try:
         bundle = joblib.load(path)
-        if isinstance(bundle, dict):
-            return bundle
-        return {"xgb": bundle, "lgbm": None}
+        return bundle if isinstance(bundle, dict) else {"xgb": bundle, "lgbm": None}
     except Exception:
         return None
 
 
 def _load_metadata(crop: str, region: str) -> dict:
+    """Load the JSON metadata sidecar. Returns empty dict if unavailable."""
     path = os.path.join(MODEL_DIR, f"{crop}_{region}_meta.json")
     if os.path.exists(path):
         try:
@@ -276,19 +294,37 @@ def _load_metadata(crop: str, region: str) -> dict:
     return {}
 
 
-def run_prediction(crop: str, region: str, target_date, lang: str = "en",
-                   market_low: float = None, market_high: float = None) -> dict:
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN PREDICTION ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+def run_prediction(
+    crop: str,
+    region: str,
+    target_date,
+    lang: str = "en",
+    market_low: float = None,
+    market_high: float = None,
+) -> dict:
     """
-    Returns a result dict with:
-        price, confidence, rmse, mae, mape, reliability,
+    Run a price forecast for (crop, region, target_date).
+
+    Returns a result dict with keys:
+        price, raw_price, confidence, rmse, mae, mape, reliability,
         n_points, trained_date, crop_key, region_key, date,
-        season, harvest_on, explanation, seasonal_adjustment_pct
-    Raises ValueError with error code on failure.
+        season, harvest_on, explanation, seasonal_adj_pct, model_version,
+        data_freshness_days
+
+    Raises ValueError with one of these error codes:
+        NO_DATA    — CSV missing or no rows for this crop/region
+        NO_MODEL   — Model .joblib file missing or unloadable
+        PAST_DATE  — target_date too far in the past
+        FORECAST_LIMIT — target_date beyond 30-day horizon
+        GENERIC_ERROR  — unexpected internal error
     """
     if not isinstance(target_date, datetime):
         target_date = datetime.combine(target_date, datetime.min.time())
 
-    # ── Load data ──────────────────────────────────────────────────────────────
+    # ── 1. Load CSV ──────────────────────────────────────────────────────────
     if not os.path.exists(DATA_PATH):
         raise ValueError("NO_DATA")
     try:
@@ -301,25 +337,28 @@ def run_prediction(crop: str, region: str, target_date, lang: str = "en",
         raise ValueError("NO_DATA")
 
     crop_df["date"] = pd.to_datetime(crop_df["date"])
-    last_date  = crop_df["date"].max()
-    delta_days = (target_date - last_date).days
+    last_date       = crop_df["date"].max()
+    delta_days      = (target_date - last_date).days
+
+    # Data freshness — how many days since the last CSV record
+    data_freshness_days = int((datetime.today() - last_date).days)
 
     if delta_days < -7:
         raise ValueError("PAST_DATE")
     if delta_days > MAX_DAYS + 5:
         raise ValueError("FORECAST_LIMIT")
 
-    # ── Load model bundle ──────────────────────────────────────────────────────
+    # ── 2. Load model ────────────────────────────────────────────────────────
     bundle = _load_bundle(crop, region)
     if bundle is None:
-        raise ValueError("NO_DATA")
+        raise ValueError("NO_MODEL")   # Distinct from NO_DATA
 
     xgb_model  = bundle.get("xgb")
     lgbm_model = bundle.get("lgbm")
     if xgb_model is None:
-        raise ValueError("NO_DATA")
+        raise ValueError("NO_MODEL")
 
-    # ── Load metadata ──────────────────────────────────────────────────────────
+    # ── 3. Load metadata ─────────────────────────────────────────────────────
     meta            = _load_metadata(crop, region)
     log_transformed = meta.get("log_transformed", True)
     mape            = meta.get("mape")
@@ -327,10 +366,12 @@ def run_prediction(crop: str, region: str, target_date, lang: str = "en",
     mae             = meta.get("mae")
     reliability     = meta.get("reliability", "Medium")
     n_points        = meta.get("n_points", len(crop_df))
-    trained_date    = meta.get("training_date", meta.get("trained_date",
-                               last_date.strftime("%d %b %Y")))
+    trained_date    = meta.get(
+        "training_date",
+        meta.get("trained_date", last_date.strftime("%d %b %Y"))
+    )
 
-    # ── Build features & predict ───────────────────────────────────────────────
+    # ── 4. Build features & predict ──────────────────────────────────────────
     try:
         pred_row = _build_prediction_features(crop, crop_df, target_date, log_transformed)
         X_pred   = pred_row.reindex(columns=FEATURE_COLS)
@@ -345,73 +386,77 @@ def run_prediction(crop: str, region: str, target_date, lang: str = "en",
         else:
             raw_pred = pred_xgb
 
-        if log_transformed:
-            predicted_price = float(np.expm1(raw_pred))
-        else:
-            predicted_price = float(raw_pred)
+        predicted_price = float(np.expm1(raw_pred)) if log_transformed else float(raw_pred)
 
     except Exception:
         raise ValueError("GENERIC_ERROR")
 
-    # ── Clamp to realistic range ───────────────────────────────────────────────
-    p_mean = float(crop_df["price"].mean())
-    p_std  = float(crop_df["price"].std())
-    predicted_price = float(np.clip(predicted_price, max(1.0, p_mean - 4 * p_std), p_mean + 4 * p_std))
+    # ── 5. Clamp to realistic historical range ───────────────────────────────
+    p_mean          = float(crop_df["price"].mean())
+    p_std           = float(crop_df["price"].std())
+    predicted_price = float(np.clip(
+        predicted_price,
+        max(1.0, p_mean - 4 * p_std),
+        p_mean + 4 * p_std,
+    ))
     predicted_price = round(predicted_price, 2)
 
-    # ── Seasonal intelligence ──────────────────────────────────────────────────
-    target_month = target_date.month
-    season       = get_season(target_month)
-    harvest_on   = target_month in HARVEST_MONTHS.get(crop, [])
-
+    # ── 6. Seasonal intelligence ─────────────────────────────────────────────
+    target_month   = target_date.month
+    season         = get_season(target_month)
+    harvest_on     = target_month in HARVEST_MONTHS.get(crop, [])
     adjusted_price = apply_seasonal_adjustment(crop, season, predicted_price)
-    seasonal_adj_pct = round((adjusted_price - predicted_price) / predicted_price * 100, 1) if predicted_price > 0 else 0.0
+    seasonal_adj_pct = (
+        round((adjusted_price - predicted_price) / predicted_price * 100, 1)
+        if predicted_price > 0 else 0.0
+    )
 
-    # ── Confidence — MAPE-based + days-ahead penalty ───────────────────────────
-    if mape is not None:
-        base_conf = 100 - mape * 0.9
-    else:
-        base_conf = 86.0
-
+    # ── 7. Confidence score: MAPE-based + days-ahead penalty ─────────────────
+    base_conf    = (100 - mape * 0.9) if mape is not None else 86.0
     days_penalty = max(0, delta_days) * 0.08
     confidence   = round(float(np.clip(base_conf - days_penalty, 75, 98)), 1)
 
     if mape is not None:
         reliability = "High" if mape < 10 else ("Medium" if mape < 18 else "Low")
 
-    # ── Trend slope (last 30 days) ────────────────────────────────────────────
+    # ── 8. Trend slope (last 30 days) ────────────────────────────────────────
     trend_df = crop_df.sort_values("date").tail(30)
     if len(trend_df) >= 5:
-        xs = np.arange(len(trend_df))
+        xs          = np.arange(len(trend_df))
         trend_slope = float(np.polyfit(xs, trend_df["price"].values, 1)[0])
     else:
         trend_slope = 0.0
 
-    # ── Explainable AI reasoning ───────────────────────────────────────────────
+    # ── 9. Explainable AI reasoning ──────────────────────────────────────────
     explanation = generate_explanation(
-        crop=crop, season=season, harvest_on=harvest_on,
-        price=adjusted_price, trend_slope=trend_slope,
-        market_low=market_low, market_high=market_high,
+        crop=crop,
+        season=season,
+        harvest_on=harvest_on,
+        price=adjusted_price,
+        trend_slope=trend_slope,
+        market_low=market_low,
+        market_high=market_high,
         lang=lang,
     )
 
     return {
-        "price":                 adjusted_price,
-        "raw_price":             predicted_price,
-        "confidence":            confidence,
-        "rmse":                  rmse,
-        "mae":                   mae,
-        "mape":                  mape,
-        "reliability":           reliability,
-        "n_points":              n_points,
-        "trained_date":          trained_date,
-        "crop_key":              crop,
-        "region_key":            region,
-        "date":                  target_date,
-        "season":                season,
-        "harvest_on":            harvest_on,
-        "trend_slope":           round(trend_slope, 3),
-        "seasonal_adj_pct":      seasonal_adj_pct,
-        "explanation":           explanation,
-        "model_version":         meta.get("model_version", "1.0"),
+        "price":               adjusted_price,
+        "raw_price":           predicted_price,
+        "confidence":          confidence,
+        "rmse":                rmse,
+        "mae":                 mae,
+        "mape":                mape,
+        "reliability":         reliability,
+        "n_points":            n_points,
+        "trained_date":        trained_date,
+        "crop_key":            crop,
+        "region_key":          region,
+        "date":                target_date,
+        "season":              season,
+        "harvest_on":          harvest_on,
+        "trend_slope":         round(trend_slope, 3),
+        "seasonal_adj_pct":    seasonal_adj_pct,
+        "explanation":         explanation,
+        "model_version":       meta.get("model_version", "2.1"),
+        "data_freshness_days": data_freshness_days,
     }

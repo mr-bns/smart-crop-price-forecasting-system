@@ -1,16 +1,15 @@
 """
-Enhanced XGBoost crop price model training — v2.0
-Improvements:
-  1. Seasonal intelligence (Kharif / Rabi / Summer)
-  2. Harvest-peak flag per crop (supply shock indicator)
-  3. Extended lag features: 1,3,7,14,30 days
-  4. Rolling mean/std: 7, 14, 30 days
-  5. Seasonal price adjustment after prediction
-  6. Broader hyperparameter search with early stopping
-  7. Rich metadata storage (feature_list, model_version, season)
-  8. log1p price transform to reduce RMSE
-  9. TimeSeriesSplit CV (n_splits=8)
-  10. Optional LightGBM blend (60% XGB + 40% LGBM)
+model/train.py  —  Enhanced XGBoost Crop Price Model Training v2.1
+===================================================================
+Improvements over v2.0:
+  • Absolute paths — works from any working directory
+  • Wrapped in main() — safe to import without running training
+  • 80/20 time-based split + TimeSeriesSplit(n_splits=8) CV
+  • Hyperparameter grid search with early stopping
+  • Optional LightGBM blend (60 % XGBoost + 40 % LightGBM)
+  • log1p price transform → lower RMSE in log space
+  • Rich metadata: version, features, freshness, MAPE/RMSE/MAE
+  • Seasonal + harvest-peak engineered features (identical to predict.py)
 """
 
 import os
@@ -22,14 +21,17 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ── Resolve project root ──────────────────────────────────────────────────────
+_HERE    = os.path.dirname(os.path.abspath(__file__))  # …/prototype/model
+_PROJECT = os.path.dirname(_HERE)                       # …/prototype
+sys.path.insert(0, _PROJECT)
 
 try:
     from xgboost import XGBRegressor
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import mean_squared_error, mean_absolute_error
-except ImportError as e:
-    raise ImportError(f"Missing: {e}. Run: pip install xgboost scikit-learn")
+except ImportError as exc:
+    raise ImportError(f"Missing dependency: {exc}. Run: pip install xgboost scikit-learn") from exc
 
 try:
     from lightgbm import LGBMRegressor
@@ -39,92 +41,61 @@ except ImportError:
 
 logging.basicConfig(level=logging.WARNING)
 
-DATA_PATH   = "data/crops.csv"
-MODEL_DIR   = "models"
-MODEL_VERSION = "2.0"
+DATA_PATH     = os.path.join(_PROJECT, "data", "crops.csv")
+MODEL_DIR     = os.path.join(_PROJECT, "models")
+MODEL_VERSION = "2.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SEASONAL INTELLIGENCE
+# SEASONAL INTELLIGENCE  (mirrors predict.py — must stay in sync)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_season(month: int) -> str:
-    """Return Indian agricultural season based on month."""
     if month in [6, 7, 8, 9, 10]:
         return "Kharif"
-    elif month in [11, 12, 1, 2, 3]:
+    if month in [11, 12, 1, 2, 3]:
         return "Rabi"
-    else:  # 4, 5
-        return "Summer"
+    return "Summer"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CROP HARVEST CALENDAR
-# Peak harvest months → harvest_peak_flag = 1
-# ─────────────────────────────────────────────────────────────────────────────
 HARVEST_MONTHS = {
-    "Tomato":      [12, 1, 2],       # Dec–Feb
-    "Onion":       [3, 4, 5],        # Mar–May
-    "Potato":      [1, 2, 3],        # Jan–Mar
-    "Paddy":       [10, 11, 12],     # Oct–Dec
-    "BitterGourd": [5, 6, 7, 8],     # May–Aug
-    "Brinjal":     [9, 10, 11],      # Sep–Nov
-    "BroadBeans":  [11, 12, 1],      # Nov–Jan
-    "Carrot":      [11, 12, 1, 2],   # Nov–Feb
-    "GreenChilli": [1, 2, 3, 4],     # Jan–Apr
-    "Okra":        [5, 6, 7, 8],     # May–Aug
+    "Tomato":      [12, 1, 2],
+    "Onion":       [3, 4, 5],
+    "Potato":      [1, 2, 3],
+    "Paddy":       [10, 11, 12],
+    "BitterGourd": [5, 6, 7, 8],
+    "Brinjal":     [9, 10, 11],
+    "BroadBeans":  [11, 12, 1],
+    "Carrot":      [11, 12, 1, 2],
+    "GreenChilli": [1, 2, 3, 4],
+    "Okra":        [5, 6, 7, 8],
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SEASONAL PRICE ADJUSTMENT RULES
-# ─────────────────────────────────────────────────────────────────────────────
-SEASONAL_ADJUSTMENT = {
-    "Tomato":      {"Kharif": +0.05, "Rabi": -0.08, "Summer": +0.12},
-    "Onion":       {"Kharif": +0.08, "Rabi": -0.05, "Summer": -0.10},
-    "Potato":      {"Kharif": +0.06, "Rabi": -0.06, "Summer": +0.08},
-    "Paddy":       {"Kharif": -0.04, "Rabi": +0.03, "Summer": +0.05},
-    "BitterGourd": {"Kharif": -0.08, "Rabi": +0.10, "Summer": -0.06},
-    "Brinjal":     {"Kharif": -0.06, "Rabi": +0.04, "Summer": +0.06},
-    "BroadBeans":  {"Kharif": +0.05, "Rabi": -0.07, "Summer": +0.08},
-    "Carrot":      {"Kharif": +0.06, "Rabi": -0.05, "Summer": +0.10},
-    "GreenChilli": {"Kharif": +0.10, "Rabi": -0.10, "Summer": +0.07},
-    "Okra":        {"Kharif": -0.07, "Rabi": +0.08, "Summer": -0.05},
-}
-
-
-def apply_seasonal_adjustment(crop: str, season: str, predicted_price: float) -> float:
-    """Apply season-aware price adjustment to simulate real market cycles."""
-    factor = SEASONAL_ADJUSTMENT.get(crop, {}).get(season, 0.0)
-    adjusted = predicted_price * (1 + factor)
-    return round(float(adjusted), 2)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE COLUMNS (strict order — must match predict.py)
+# FEATURE COLUMNS  (strict order — must match predict.py)
 # ─────────────────────────────────────────────────────────────────────────────
 FEATURE_COLS = [
-    # Calendar — cyclical encoded
     "month_sin", "month_cos", "dow_sin", "dow_cos",
     "weekofyear", "dayofyear", "quarter",
-    # Required lags
     "lag_1", "lag_3", "lag_7", "lag_14", "lag_30",
-    # Rolling statistics
     "rolling_mean_7", "rolling_mean_14", "rolling_mean_30",
     "rolling_std_7", "rolling_std_30",
-    # Momentum
     "price_change_7", "price_pct_7",
-    # Seasonal
     "season_kharif", "season_rabi", "season_summer",
     "harvest_peak_flag",
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
 def engineer_features(df: pd.DataFrame, crop: str) -> pd.DataFrame:
-    df = df.copy().sort_values("ds").reset_index(drop=True)
+    """Add all time-series features to a DataFrame with columns [ds, y]."""
+    df    = df.copy().sort_values("ds").reset_index(drop=True)
     df["ds"] = pd.to_datetime(df["ds"])
 
     month = df["ds"].dt.month
     dow   = df["ds"].dt.dayofweek
 
-    # ── Calendar (cyclical) ──────────────────────────────────────────────────
+    # Cyclical calendar encoding
     df["month_sin"]  = np.sin(2 * np.pi * month / 12)
     df["month_cos"]  = np.cos(2 * np.pi * month / 12)
     df["dow_sin"]    = np.sin(2 * np.pi * dow / 7)
@@ -133,11 +104,11 @@ def engineer_features(df: pd.DataFrame, crop: str) -> pd.DataFrame:
     df["dayofyear"]  = df["ds"].dt.dayofyear
     df["quarter"]    = df["ds"].dt.quarter
 
-    # ── Lag features ─────────────────────────────────────────────────────────
+    # Extended lag features
     for lag in [1, 3, 7, 14, 30]:
         df[f"lag_{lag}"] = df["y"].shift(lag)
 
-    # ── Rolling statistics (lag-1 shifted to prevent leakage) ────────────────
+    # Rolling statistics — shift-1 to prevent leakage
     shifted = df["y"].shift(1)
     df["rolling_mean_7"]  = shifted.rolling(7,  min_periods=1).mean()
     df["rolling_mean_14"] = shifted.rolling(14, min_periods=1).mean()
@@ -145,34 +116,46 @@ def engineer_features(df: pd.DataFrame, crop: str) -> pd.DataFrame:
     df["rolling_std_7"]   = shifted.rolling(7,  min_periods=2).std().fillna(0)
     df["rolling_std_30"]  = shifted.rolling(30, min_periods=2).std().fillna(0)
 
-    # ── Momentum ─────────────────────────────────────────────────────────────
+    # Momentum
     df["price_change_7"] = df["y"] - df["y"].shift(7)
     df["price_pct_7"]    = df["y"].pct_change(7).replace([np.inf, -np.inf], 0).fillna(0)
 
-    # ── Seasonal one-hot ──────────────────────────────────────────────────────
+    # Seasonal one-hot
     seasons = month.apply(get_season)
     df["season_kharif"] = (seasons == "Kharif").astype(int)
     df["season_rabi"]   = (seasons == "Rabi").astype(int)
     df["season_summer"] = (seasons == "Summer").astype(int)
 
-    # ── Harvest peak flag ─────────────────────────────────────────────────────
+    # Harvest peak flag
     hm = HARVEST_MONTHS.get(crop, [])
     df["harvest_peak_flag"] = month.isin(hm).astype(int)
 
     return df.dropna(subset=FEATURE_COLS)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# METRICS
+# ─────────────────────────────────────────────────────────────────────────────
 def compute_metrics(actual, predicted):
     actual    = np.array(actual,    dtype=float)
-    predicted = np.array(predicted, dtype=float)
-    predicted = np.clip(predicted, 0.01, None)
+    predicted = np.clip(np.array(predicted, dtype=float), 0.01, None)
     rmse = float(np.sqrt(mean_squared_error(actual, predicted)))
     mae  = float(mean_absolute_error(actual, predicted))
-    mape = float(np.mean(np.abs((actual - predicted) / np.where(actual == 0, 1e-9, actual))) * 100)
+    mape = float(
+        np.mean(np.abs((actual - predicted) / np.where(actual == 0, 1e-9, actual))) * 100
+    )
     return round(rmse, 3), round(mae, 3), round(mape, 3)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE MODEL TRAINER
+# ─────────────────────────────────────────────────────────────────────────────
 def train_single(crop: str, region: str, df: pd.DataFrame):
+    """
+    Train one XGBoost (+optional LGBM) model for a single crop-region pair.
+
+    Returns (model_bundle_dict, metadata_dict) or None if insufficient data.
+    """
     raw = df[["date", "price"]].copy()
     raw.columns = ["ds", "y"]
     raw["ds"] = pd.to_datetime(raw["ds"])
@@ -181,7 +164,7 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
     if len(raw) < 60:
         return None
 
-    # ── Outlier removal (IQR method + z-score) ───────────────────────────────
+    # ── Outlier removal: IQR + z-score ──────────────────────────────────────
     q1, q3 = raw["y"].quantile(0.25), raw["y"].quantile(0.75)
     iqr     = q3 - q1
     mu, sigma = raw["y"].mean(), raw["y"].std()
@@ -196,7 +179,7 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
     price_mean_orig = float(raw["y"].mean())
     price_std_orig  = float(raw["y"].std())
 
-    # ── Log1p transform ───────────────────────────────────────────────────────
+    # ── log1p transform → reduces RMSE, compresses outliers ─────────────────
     raw["y"] = np.log1p(raw["y"])
 
     feat_df = engineer_features(raw, crop)
@@ -206,16 +189,19 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
     X = feat_df[FEATURE_COLS]
     y = feat_df["y"].values
 
-    # ── 80/20 time-based holdout ──────────────────────────────────────────────
-    split  = int(len(X) * 0.80)
-    X_tr, X_te = X.iloc[:split], X.iloc[split:]
-    y_tr, y_te = y[:split], y[split:]
+    # ── 80/20 time-based holdout ─────────────────────────────────────────────
+    split       = int(len(X) * 0.80)
+    X_tr, X_te  = X.iloc[:split], X.iloc[split:]
+    y_tr, y_te  = y[:split], y[split:]
 
-    # ── Hyperparameter grid search with TimeSeriesSplit ───────────────────────
+    # ── Hyperparameter grid + TimeSeriesSplit CV ─────────────────────────────
     tscv = TimeSeriesSplit(n_splits=8)
-    best_params  = {"n_estimators": 400, "max_depth": 5, "learning_rate": 0.04,
-                    "subsample": 0.85, "colsample_bytree": 0.80,
-                    "min_child_weight": 3, "gamma": 0.1, "reg_alpha": 0.1}
+
+    # Default params in case grid is skipped
+    best_params  = {
+        "n_estimators": 400, "max_depth": 5, "learning_rate": 0.04,
+        "min_child_weight": 3, "gamma": 0.1, "reg_alpha": 0.1,
+    }
     best_cv_rmse = float("inf")
 
     param_grid = [
@@ -236,8 +222,7 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
                 **params,
                 reg_lambda=1.0, subsample=0.85, colsample_bytree=0.80,
                 random_state=42, verbosity=0, n_jobs=-1,
-                early_stopping_rounds=30,
-                eval_metric="rmse",
+                early_stopping_rounds=30, eval_metric="rmse",
             )
             m.fit(
                 X_tr.iloc[tr_i], y_tr[tr_i],
@@ -251,7 +236,7 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
             best_cv_rmse = float(np.mean(cv_rmses))
             best_params  = {**params}
 
-    # ── Train final XGBoost ───────────────────────────────────────────────────
+    # ── Train final XGBoost on training split ────────────────────────────────
     xgb_model = XGBRegressor(
         **best_params,
         reg_lambda=1.0, subsample=0.85, colsample_bytree=0.80,
@@ -276,17 +261,16 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
         except Exception:
             lgbm_model = None
 
-    # ── Evaluate on holdout ───────────────────────────────────────────────────
+    # ── Evaluate on holdout (log-space predictions → inverse transform) ───────
     rmse = mae = mape = None
     if len(X_te) >= 5:
-        preds_xgb = xgb_model.predict(X_te)
-        if lgbm_model is not None:
-            preds_lgbm = lgbm_model.predict(X_te)
-            preds_te   = 0.60 * preds_xgb + 0.40 * preds_lgbm
-        else:
-            preds_te = preds_xgb
-        y_te_real  = np.expm1(y_te)
-        preds_real = np.expm1(preds_te)
+        preds_xgb  = xgb_model.predict(X_te)
+        preds_te   = (
+            0.60 * preds_xgb + 0.40 * lgbm_model.predict(X_te)
+            if lgbm_model is not None else preds_xgb
+        )
+        y_te_real    = np.expm1(y_te)
+        preds_real   = np.expm1(preds_te)
         rmse, mae, mape = compute_metrics(y_te_real, preds_real)
 
     # ── Re-fit on ALL data for deployment ────────────────────────────────────
@@ -294,7 +278,7 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
     if lgbm_model is not None:
         lgbm_model.fit(X, y)
 
-    # ── Confidence & reliability ──────────────────────────────────────────────
+    # ── Reliability & confidence ────────────────────────────────────────────
     if mape is not None:
         confidence  = float(np.clip(100 - mape * 0.9, 75, 98))
         reliability = "High" if mape < 10 else ("Medium" if mape < 18 else "Low")
@@ -302,55 +286,61 @@ def train_single(crop: str, region: str, df: pd.DataFrame):
         confidence  = 86.0
         reliability = "Medium"
 
+    # ── Data freshness ────────────────────────────────────────────────────────
+    last_date           = raw["ds"].max()
+    data_freshness_days = int((datetime.today() - last_date).days)
+
     metadata = {
-        "crop":             crop,
-        "region":           region,
-        "n_points":         len(feat_df),
-        "training_date":    datetime.now().strftime("%d %b %Y"),
-        "training_records": len(raw),
-        "best_params":      best_params,
-        "use_lgbm_blend":   lgbm_model is not None,
-        "log_transformed":  True,
-        "rmse":             rmse,
-        "mae":              mae,
-        "mape":             mape,
-        "confidence":       round(confidence, 1),
-        "reliability":      reliability,
-        "model_version":    MODEL_VERSION,
-        "feature_list":     FEATURE_COLS,
-        "price_mean":       round(price_mean_orig, 2),
-        "price_std":        round(price_std_orig, 2),
-        "last_date":        str(raw["ds"].max().date()),
+        "crop":                 crop,
+        "region":               region,
+        "n_points":             len(feat_df),
+        "training_date":        datetime.now().strftime("%d %b %Y"),
+        "training_records":     len(raw),
+        "best_params":          best_params,
+        "use_lgbm_blend":       lgbm_model is not None,
+        "log_transformed":      True,
+        "rmse":                 rmse,
+        "mae":                  mae,
+        "mape":                 mape,
+        "confidence":           round(confidence, 1),
+        "reliability":          reliability,
+        "model_version":        MODEL_VERSION,
+        "feature_list":         FEATURE_COLS,
+        "price_mean":           round(price_mean_orig, 2),
+        "price_std":            round(price_std_orig, 2),
+        "last_date":            str(last_date.date()),
+        "data_freshness_days":  data_freshness_days,
     }
 
-    model_bundle = {"xgb": xgb_model, "lgbm": lgbm_model}
-    return model_bundle, metadata
+    return {"xgb": xgb_model, "lgbm": lgbm_model}, metadata
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAIN ALL MODELS
+# ─────────────────────────────────────────────────────────────────────────────
 def train_all_models():
-    print("🚀 Starting Enhanced XGBoost v2 Training (seasonal + harvest calendar + IQR)…")
-    if HAS_LGBM:
-        print("   ✅ LightGBM detected — blend models enabled")
-    else:
-        print("   ℹ️  LightGBM not found — XGBoost only (pip install lightgbm)")
+    print(f"🚀 Enhanced XGBoost v{MODEL_VERSION} — Training all crop-region models …")
+    print(f"   LightGBM blend : {'✅ enabled' if HAS_LGBM else '⬜ disabled (pip install lightgbm)'}")
+    print(f"   Data source    : {DATA_PATH}")
+    print(f"   Model output   : {MODEL_DIR}")
+    print()
 
     if not os.path.exists(DATA_PATH):
-        print(f"❌ {DATA_PATH} not found. Run generate_data.py first.")
+        print(f"❌ {DATA_PATH} not found. Run: python generate_data.py")
         return
 
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     try:
         df = pd.read_csv(DATA_PATH)
-    except Exception as e:
-        print(f"❌ {e}")
+    except Exception as exc:
+        print(f"❌ Failed to read CSV: {exc}")
         return
 
-    # Remove duplicates globally
     df = df.drop_duplicates(subset=["date", "crop", "region"])
     df = df.dropna(subset=["price"])
 
-    combinations = df[["crop", "region"]].drop_duplicates().values
+    combinations   = df[["crop", "region"]].drop_duplicates().values
     count, skipped = 0, 0
 
     for crop, region in combinations:
@@ -360,7 +350,7 @@ def train_all_models():
         try:
             result = train_single(crop, region, crop_df)
             if result is None:
-                print("⚠️  skipped (not enough data)")
+                print("⚠️  skipped (insufficient data)")
                 skipped += 1
                 continue
 
@@ -369,7 +359,7 @@ def train_all_models():
             with open(os.path.join(MODEL_DIR, f"{crop}_{region}_meta.json"), "w") as f:
                 json.dump(meta, f, indent=2)
 
-            blend_tag = " [XGB+LGBM]" if meta["use_lgbm_blend"] else " [XGB]"
+            blend_tag = " [XGB+LGBM]" if meta["use_lgbm_blend"] else " [XGB only]"
             mape_str  = (
                 f"RMSE={meta['rmse']}  MAPE={meta['mape']}%  "
                 f"conf={meta['confidence']}%  [{meta['reliability']}]{blend_tag}"
@@ -377,12 +367,13 @@ def train_all_models():
             print(f"✅  {mape_str}")
             count += 1
 
-        except Exception as e:
-            print(f"❌ {e}")
+        except Exception as exc:
+            print(f"❌  error: {exc}")
             skipped += 1
 
     print(f"\n✅ Done — {count} models saved, {skipped} skipped.")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     train_all_models()
