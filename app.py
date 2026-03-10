@@ -15,12 +15,14 @@ load_dotenv()
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 try:
-    from model.predict import run_prediction
+    from model.predict import run_prediction, MIN_ROWS
     from market_data import get_market_price
-    from advisory import generate_advisory
+    from advisory import generate_advisory, get_explanation_bullets
     from language_map import LANG
+    from ui.components import get_crop_image_path
 except ImportError as e:
-    st.error(f"❌ Import error: {e}")
+    import streamlit as st
+    st.error(f"❌ Module import error: {e}. Ensure all project files are present and dependencies installed.")
     st.stop()
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -442,6 +444,7 @@ if st.session_state.show_res and st.session_state.result:
     st.markdown(f'<div class="section-tag">{T["res_tag"]}</div>', unsafe_allow_html=True)
 
     if "error" in res:
+        err_code = res["error"]
         err_map = {
             "NO_MODEL":       T["no_model"],
             "NO_DATA":        T.get("no_data", T["no_model"]),
@@ -449,7 +452,12 @@ if st.session_state.show_res and st.session_state.result:
             "FORECAST_LIMIT": T["fc_limit"],
             "GENERIC_ERROR":  T["generic_err"],
         }
-        st.error(f"⚠️ {err_map.get(res['error'], res['error'])}")
+        err_msg = err_map.get(err_code, err_code)
+        st.markdown(f"""
+        <div style="background:rgba(239,83,80,.1);border:1px solid rgba(239,83,80,.3);border-left:4px solid #ef5350;
+                    border-radius:12px;padding:1.1rem 1.4rem;color:#ef9a9a;font-size:.92rem;line-height:1.6;margin:.8rem 0;">
+          <strong>⚠️ {T.get('res_tag','Error')}</strong><br>{err_msg}
+        </div>""", unsafe_allow_html=True)
     else:
         ck          = res["crop_key"]
         rk          = res["region_key"]
@@ -467,22 +475,30 @@ if st.session_state.show_res and st.session_state.result:
         crop_disp   = TL["crops"].get(ck, ck)
         region_disp = TL["regions"].get(rk, DISTRICT_DISPLAY.get(rk, rk))
 
-        # Header
-        s_badge    = season_badge(season)
-        rel_badge  = reliability_badge(reliability)
-        harvest_lbl = T["harvest_on"] if harvest_on else T["harvest_off"]
+        # Header — crop image INSIDE the green card
+        s_badge       = season_badge(season)
+        rel_badge     = reliability_badge(reliability)
+        harvest_lbl   = T["harvest_on"] if harvest_on else T["harvest_off"]
         harvest_color = "#81c784" if harvest_on else "#ffca28"
+
+        # Build image HTML (base64 so it renders inside markdown)
+        from ui.components import crop_image_html as _crop_img_html
+        img_html = _crop_img_html(ck, size=86)
+
         st.markdown(f"""
         <div class="results-header-card fade-in">
           <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;">
-            <div>
-              <div class="results-crop-name">🌱 {crop_disp}</div>
-              <div class="results-meta">📍 {region_disp} &nbsp;|&nbsp; 📅 {date_str}</div>
-              <div style="margin-top:.5rem;display:flex;gap:.5rem;flex-wrap:wrap;">
-                {s_badge}
-                <span class="badge" style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);color:{harvest_color};">
-                  🌾 {T['harvest_badge']}: {harvest_lbl}
-                </span>
+            <div style="display:flex;align-items:center;gap:1.1rem;">
+              {img_html}
+              <div>
+                <div class="results-crop-name">{crop_disp}</div>
+                <div class="results-meta">📍 {region_disp} &nbsp;|&nbsp; 📅 {date_str}</div>
+                <div style="margin-top:.5rem;display:flex;gap:.5rem;flex-wrap:wrap;">
+                  {s_badge}
+                  <span class="badge" style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);color:{harvest_color};">
+                    🌾 {T['harvest_badge']}: {harvest_lbl}
+                  </span>
+                </div>
               </div>
             </div>
             <div style="display:flex;flex-direction:column;align-items:flex-end;gap:.4rem;">
@@ -492,6 +508,7 @@ if st.session_state.show_res and st.session_state.result:
           </div>
         </div>
         """, unsafe_allow_html=True)
+
 
         # Metrics
         market_avg = round((low + high) / 2, 2) if low and high else None
@@ -531,16 +548,49 @@ if st.session_state.show_res and st.session_state.result:
         <div class="advisory-card {advice_cls}">{advice}</div>
         """, unsafe_allow_html=True)
 
-        # AI Explanation
+        # Low data warning
+        n_pts = res.get("n_points", 0)
+        if isinstance(n_pts, int) and n_pts < MIN_ROWS:
+            low_data_tmpl = TL.get("low_data_warning", "⚠️ Only {n} data points found.")
+            st.markdown(
+                f'<div style="background:rgba(255,193,7,.10);border:1px solid rgba(255,193,7,.35);border-radius:10px;'
+                f'padding:.7rem 1rem;font-size:.88rem;color:#ffca28;margin:.8rem 0;">'
+                f'{low_data_tmpl.format(n=n_pts)}</div>',
+                unsafe_allow_html=True
+            )
+
+        # AI Explanation — use get_explanation_bullets fallback if model didn't return any
+        if not explanation:
+            try:
+                trend_slope = 0.0
+                # Quick slope estimate from last 14 days
+                df_tmp = load_data()
+                if not df_tmp.empty:
+                    crop_hist = df_tmp[(df_tmp["crop"]==ck) & (df_tmp["region"]==rk)].sort_values("date").tail(14)
+                    if len(crop_hist) >= 2:
+                        trend_slope = float(crop_hist["price"].iloc[-1] - crop_hist["price"].iloc[0])
+                explanation = get_explanation_bullets(
+                    season=season,
+                    harvest_on=harvest_on,
+                    trend_slope=trend_slope,
+                    predicted_price=price,
+                    market_low=low,
+                    market_high=high,
+                    lang=st.session_state.lang,
+                )
+            except Exception:
+                pass
+
         if explanation:
             items_html = "".join(
                 f'<div class="explain-item"><div class="explain-dot"></div><span>{pt}</span></div>'
                 for pt in explanation
             )
+            explain_title_key = TL.get("explanation_title", T.get("explain_title", "Why This Price?"))
             st.markdown(f"""
             <div class="explain-card fade-in fade-in-2">
               <div class="section-tag" style="margin-bottom:.6rem;">{T['explain_tag']}</div>
-              <div class="explain-title">{T['explain_title']}</div>
+              <div class="explain-title">{explain_title_key}</div>
               <p style="font-size:.8rem;color:rgba(255,255,255,.35);margin-bottom:.8rem;">{T['explain_sub']}</p>
               {items_html}
             </div>

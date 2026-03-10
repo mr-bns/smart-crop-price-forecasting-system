@@ -332,7 +332,26 @@ def train_all_models():
         print(f"❌ Failed to read CSV: {exc}")
         return
 
+    # ── Dataset validation ───────────────────────────────────────────────────
+    REQUIRED_COLS = {"date", "crop", "region", "price"}
+    missing = REQUIRED_COLS - set(df.columns)
+    if missing:
+        print(f"❌ Dataset missing required columns: {missing}")
+        return
+
+    before = len(df)
     df = df.drop_duplicates(subset=["date", "crop", "region"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "price"])
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df = df[df["price"] > 0].copy()
+    df = df.sort_values(["crop", "region", "date"]).reset_index(drop=True)
+    after = len(df)
+    if before != after:
+        print(f"   ⚠️  Removed {before - after} bad/duplicate rows (kept {after}).")
+    # ────────────────────────────────────────────────────────────────────────
+
+    df = df.drop_duplicates(subset=["date", "crop", "region"])   # second pass post-coerce
     df = df.dropna(subset=["price"])
 
     combinations   = df[["crop", "region"]].drop_duplicates().values
@@ -341,6 +360,12 @@ def train_all_models():
     for crop, region in combinations:
         print(f"   🌱 {crop}/{region} … ", end="", flush=True)
         crop_df = df[(df["crop"] == crop) & (df["region"] == region)].copy()
+
+        # Warn if very few rows
+        if len(crop_df) < 30:
+            print(f"⚠️  skipped (only {len(crop_df)} rows — need ≥30)")
+            skipped += 1
+            continue
 
         try:
             result = train_single(crop, region, crop_df)

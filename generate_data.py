@@ -101,12 +101,12 @@ def generate() -> pd.DataFrame:
 
                 # 1. Seasonal effect  —  harvest = supply glut → lower prices
                 if month in harvest_months:
-                    seasonal_factor = np.random.uniform(0.75, 0.88)
+                    seasonal_factor = np.random.uniform(0.85, 0.95)  # raised floor: no deeper than -15%
                 elif month in [(harvest_months[-1] % 12) + 1,
                                (harvest_months[-1] % 12) + 2]:
-                    seasonal_factor = np.random.uniform(0.90, 1.00)   # recovering
+                    seasonal_factor = np.random.uniform(0.97, 1.05)   # recovering fast
                 else:
-                    seasonal_factor = np.random.uniform(1.05, 1.20)   # lean season
+                    seasonal_factor = np.random.uniform(1.06, 1.18)   # lean season
 
                 # 2. Post-harvest 1-week recovery ramp
                 weekday_effect = -0.5 if date.weekday() == 0 else 0.0
@@ -125,8 +125,8 @@ def generate() -> pd.DataFrame:
                              * np.random.choice([-1, 1]))
 
                 price = price + mean_rev + noise + weekday_effect + shock
-                # Hard clamp: 40%–250% of adjusted base
-                price = float(np.clip(price, adjusted_base * 0.40, adjusted_base * 2.50))
+                # Hard clamp: 60%–180% of adjusted base (tighter realistic range)
+                price = float(np.clip(price, adjusted_base * 0.60, adjusted_base * 1.80))
 
                 data.append({
                     "date":   date.strftime("%Y-%m-%d"),
